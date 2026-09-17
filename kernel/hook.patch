@@ -1,0 +1,59 @@
+diff --color -Naur a/arch/x86/Kconfig b/arch/x86/Kconfig
+--- a/arch/x86/Kconfig
++++ b/arch/x86/Kconfig
+@@ -1760,6 +1760,18 @@
+ 	  specific cases in protected and virtual-8086 modes. Emulated
+ 	  results are dummy.
+ 
++config X86_UD_EMULATE
++	bool "Emulate SSE4.2, POPCNT, AES-NI and PCLMULQDQ for user space"
++	depends on X86_64
++	help
++	  Emulate, from the #UD trap, the SSE4.2 (POPCNT, CRC32, PCMPGTQ,
++	  PCMPxSTRx), AES-NI and PCLMULQDQ instructions on CPUs that lack
++	  them (Core 2 / Penryn), so prebuilt x86-64-v2 binaries run instead
++	  of dying with SIGILL.  Inert on CPUs that have every instruction;
++	  opemu.enable=0 disables it, /sys/kernel/debug/opemu/ shows counts.
++
++	  Say N unless you are running such a machine.
++
+ config CC_HAS_IBT
+ 	# GCC >= 9 and binutils >= 2.29
+ 	# Retpoline check to work around https://gcc.gnu.org/bugzilla/show_bug.cgi?id=93654
+diff --color -Naur a/arch/x86/kernel/Makefile b/arch/x86/kernel/Makefile
+--- a/arch/x86/kernel/Makefile
++++ b/arch/x86/kernel/Makefile
+@@ -157,6 +157,7 @@
+ obj-$(CONFIG_PERF_EVENTS)		+= perf_regs.o
+ obj-$(CONFIG_SCHED_MC_PRIO)		+= itmt.o
+ obj-$(CONFIG_X86_UMIP)			+= umip.o
++obj-$(CONFIG_X86_UD_EMULATE)		+= opemu.o opemu-core.o
+ 
+ obj-$(CONFIG_UNWINDER_ORC)		+= unwind_orc.o
+ obj-$(CONFIG_UNWINDER_FRAME_POINTER)	+= unwind_frame.o
+diff --color -Naur a/arch/x86/kernel/traps.c b/arch/x86/kernel/traps.c
+--- a/arch/x86/kernel/traps.c
++++ b/arch/x86/kernel/traps.c
+@@ -63,6 +63,7 @@
+ #include <asm/fpu/xstate.h>
+ #include <asm/vm86.h>
+ #include <asm/umip.h>
++#include <asm/opemu.h>
+ #include <asm/insn.h>
+ #include <asm/insn-eval.h>
+ #include <asm/vdso.h>
+@@ -394,7 +395,13 @@
+ 
+ 	state = irqentry_enter(regs);
+ 	instrumentation_begin();
+-	handle_invalid_op(regs);
++	/*
++	 * A user-mode #UD may be an SSE4.2/POPCNT/AES-NI/PCLMULQDQ
++	 * instruction this CPU lacks; CONFIG_X86_UD_EMULATE executes it here
++	 * the way UMIP executes SGDT & co. from the #GP handler.
++	 */
++	if (!(user_mode(regs) && opemu_fixup_ud(regs)))
++		handle_invalid_op(regs);
+ 	instrumentation_end();
+ 	irqentry_exit(regs, state);
+ }
