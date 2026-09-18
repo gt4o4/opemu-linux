@@ -7,15 +7,16 @@
  * twice, once by the real instruction and once by the emulator, and the
  * results and flags must agree bit for bit.
  *
- * On a CPU without SSE4.2 the differential half is skipped and only the
- * fixed vectors run, so the test is still meaningful (and still exits 0)
- * wherever it lands.
+ * The silicon is MANDATORY.  Without SSE4.2 this test exits 2 and runs
+ * nothing; until 2026-09-18 it skipped the differential half and still
+ * exited 0, so a build scheduled on the wrong machine could certify nothing
+ * and pass.  For the same reason the number of checks is asserted against
+ * the loop bounds: a path that quietly skips vectors cannot pass either.
  *
- * Covered here: POPCNT, CRC32, PCMPISTRI, PCMPISTRM.  PCMPISTRM had no
- * differential cover until 2026-09-17 even though it executes in the
- * real workload (twice per `claude --version`) — the index form was
- * swept exhaustively and the mask form was taken on trust.  It isn't
- * now.  AES, PCLMULQDQ, PCMPGTQ and PCMPESTRx are in test-vec.c.
+ * Covered here: POPCNT, CRC32, PCMPISTRI and PCMPISTRM over ALL 256 control
+ * bytes (imm8[7] is reserved; the silicon ignores it and the sweep proves
+ * the emulator does too — see imm-tables.h) and the vector shapes of
+ * vectors.h.  AES, PCLMULQDQ, PCMPGTQ and PCMPESTRx are in test-vec.c.
  */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -24,6 +25,10 @@
 #include <stdlib.h>
 #include "../preload/sse42emu.h"
 #include "imm-tables.h"
+#include "vectors.h"
+
+#define N_POPCNT 4000
+#define N_ISTR   20000                  /* shaped vectors, after the fixed edges */
 
 static int failures, checks;
 static uint64_t rng = 0x243F6A8885A308D3ULL;
@@ -55,11 +60,11 @@ static void istri_##IMM(const uint8_t *a, const uint8_t *b,                   \
                      : "=&r"(i), "=&r"(f) : "r"(a), "r"(b)                    \
                      : "xmm1", "xmm2", "rcx", "cc", "memory");                \
     *idx = i; *fl = f; }
-IMM_EXPAND_128
+IMM_EXPAND_256
 #undef X
-static istri_fn istri_tab[128] = {
+static istri_fn istri_tab[256] = {
 #define X(IMM) istri_##IMM,
-IMM_EXPAND_128
+IMM_EXPAND_256
 #undef X
 };
 
@@ -75,11 +80,11 @@ static void istrm_##IMM(const uint8_t *a, const uint8_t *b,                   \
                      : "=&r"(f) : "r"(a), "r"(b), "r"(mask)                   \
                      : "xmm0", "xmm1", "xmm2", "cc", "memory");               \
     *fl = f; }
-IMM_EXPAND_128
+IMM_EXPAND_256
 #undef X
-static istrm_fn istrm_tab[128] = {
+static istrm_fn istrm_tab[256] = {
 #define X(IMM) istrm_##IMM,
-IMM_EXPAND_128
+IMM_EXPAND_256
 #undef X
 };
 
@@ -92,7 +97,7 @@ static void dump(const char *tag, const uint8_t *v)
 
 static void check_popcnt(void)
 {
-    for (int t = 0; t < 4000; t++) {
+    for (int t = 0; t < N_POPCNT; t++) {
         uint64_t v = rnd();
         if (t < 4) v = (uint64_t) t;          /* include 0 for the ZF case */
         sse42emu_regs R; memset(&R, 0, sizeof R);
@@ -127,35 +132,31 @@ static void check_crc32(void)
     }
 }
 
+/* The mask form runs on every fixed edge pair and on every 4th shaped
+ * vector: it is the same core, and the mask expansion is what is under
+ * test there, not the aggregation again. */
+static int istrm_here(int t) { return t < VEC_N_EDGE || (t & 3) == 0; }
+
 static void check_istr_differential(void)
 {
-    if (!have_sse42()) { printf("  (no SSE4.2 here: differential half skipped)\n"); return; }
-    for (int t = 0; t < 20000; t++) {
+    for (int t = 0; t < VEC_N_EDGE + N_ISTR; t++) {
         uint8_t a[16], b[16];
-        for (int i = 0; i < 16; i++) {
-            /* Bias hard toward short strings and shared bytes: the
-             * invalid-element override table only shows up there. */
-            a[i] = (uint8_t) (rnd() % ((t % 3) ? 4 : 256));
-            b[i] = (uint8_t) (rnd() % ((t % 3) ? 4 : 256));
-        }
-        for (int imm = 0; imm < 128; imm++) {
+        vec_pair(t, a, b);
+        for (int imm = 0; imm < 256; imm++) {
             uint32_t ridx = 0, eidx = 0; uint64_t rfl = 0, efl = 0;
             istri_tab[imm](a, b, &ridx, &rfl);
             sse42emu_pcmpistr(a, b, (uint8_t) imm, &eidx, NULL, &efl);
             checks++;
             if (ridx != eidx || (rfl & FLMASK) != (efl & FLMASK)) {
                 if (failures < 10) {
-                    printf("  pcmpistri imm=0x%02x: hw idx=%u fl=%04lx  emu idx=%u fl=%04lx\n",
-                           imm, ridx, rfl & FLMASK, eidx, efl & FLMASK);
+                    printf("  pcmpistri imm=0x%02x%s%s: hw idx=%u fl=%04lx  emu idx=%u fl=%04lx\n",
+                           imm, t < VEC_N_EDGE ? " " : "", t < VEC_N_EDGE ? vec_edges[t].why : "",
+                           ridx, rfl & FLMASK, eidx, efl & FLMASK);
                     dump("a", a); dump("b", b);
                 }
                 failures++;
             }
-
-            /* Same vectors through the MASK form.  Only every 4th
-             * iteration: it is the same core, and the mask expansion is
-             * what is under test, not the aggregation again. */
-            if ((t & 3) == 0) {
+            if (istrm_here(t)) {
                 uint8_t rm[16], em[16]; uint64_t rf2 = 0, ef2 = 0;
                 istrm_tab[imm](a, b, rm, &rf2);
                 sse42emu_pcmpistr(a, b, (uint8_t) imm, NULL, em, &ef2);
@@ -175,11 +176,19 @@ static void check_istr_differential(void)
 
 int main(void)
 {
-    printf("sse42emu differential test (host %s SSE4.2)\n",
-           have_sse42() ? "HAS" : "lacks");
+    if (!have_sse42()) {
+        printf("test-emu: this machine has no SSE4.2 — the differential test cannot run here.\n"
+               "          Build where the silicon is (lix-ory); nothing was verified.\n");
+        return 2;
+    }
+    int planned = N_POPCNT + 1;
+    for (int t = 0; t < VEC_N_EDGE + N_ISTR; t++) planned += 256 * (1 + istrm_here(t));
+
+    printf("sse42emu differential test (host HAS SSE4.2)\n");
     check_popcnt();
     check_crc32();
     check_istr_differential();
     printf("%d checks, %d failures\n", checks, failures);
+    if (checks != planned) { printf("  ran %d checks, planned %d — a path skipped vectors\n", checks, planned); return 1; }
     return failures ? 1 : 0;
 }

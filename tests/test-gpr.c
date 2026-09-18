@@ -19,11 +19,17 @@ static void both(const uint8_t *code, unsigned len, uint64_t rax_in, uint64_t rd
                  page = mmap(0,4096,7,0x22,-1,0); }
     memcpy(page, code, len);
     page[len] = 0xC3;                       /* ret */
-    __asm__ volatile("push %%rbx\n\tmov %2,%%rax\n\tmov %3,%%rdx\n\t"
-                     "call *%4\n\tmov %%rax,%0\n\tpushfq\n\tpop %1\n\tpop %%rbx"
-                     : "=r"(hw_rax), "=r"(hw_fl)
+    /* The stub is `<insn> ; ret` and touches nothing but rax/rdx/flags.
+     * Early-clobber outputs: a compiler is free to hand an output the
+     * register of a dead input, or (gcc 13 did) a register the asm text
+     * itself uses — an older version of this saved and restored %rbx
+     * around the call and gcc put hw_fl IN %rbx, so the restore
+     * overwrote the flags and every check failed. */
+    __asm__ volatile("mov %2,%%rax\n\tmov %3,%%rdx\n\t"
+                     "call *%4\n\tmov %%rax,%0\n\tpushfq\n\tpop %1"
+                     : "=&r"(hw_rax), "=&r"(hw_fl)
                      : "r"(rax_in), "r"(rdx_in), "r"(page)
-                     : "rax","rcx","rdx","r14","cc","memory");
+                     : "rax","rcx","rdx","cc","memory");
     sse42emu_regs R; memset(&R,0,sizeof R);
     R.gpr[REG_RAX]=rax_in; R.gpr[REG_RDX]=rdx_in; R.rip=(uint64_t)(uintptr_t)code;
     n++;
@@ -36,7 +42,7 @@ static void both(const uint8_t *code, unsigned len, uint64_t rax_in, uint64_t rd
 }
 int main(void){
   uint32_t a,b,c,d; __asm__ volatile("cpuid":"=a"(a),"=b"(b),"=c"(c),"=d"(d):"a"(1),"c"(0));
-  if(!((c>>20)&1)){printf("no SSE4.2 here — skipping\n");return 0;}
+  if(!((c>>20)&1)){printf("test-gpr: no SSE4.2 here — the differential test cannot run; build on lix-ory\n");return 2;}
   for(int t=0;t<3000;t++){
     uint64_t x = (t<3)?(uint64_t)t:rnd();
     /* popcnt rax, rax : F3 48 0F B8 C0 */
@@ -53,5 +59,6 @@ int main(void){
     both((const uint8_t[]){0xF2,0x0F,0x38,0xF1,0xC2},5,0x1234,x,"crc32 eax,edx");
   }
   printf("%d checks, %d failures\n", n, fails);
+  if(n!=3000*6){printf("  ran %d checks, planned %d\n",n,3000*6);return 1;}
   return fails?1:0;
 }

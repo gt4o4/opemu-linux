@@ -13,3 +13,4 @@ tests/vm/init
 tests/bench/bench
 qemu_*.core
 core
+/build/

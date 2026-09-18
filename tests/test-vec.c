@@ -19,8 +19,13 @@
  * are all invisible to layer 1.
  *
  * The hardware half needs AES-NI/PCLMULQDQ/SSE4.2 — the build machine
- * has them and the target host is the one that does not.  Where a
- * feature is missing the matching half is skipped and said so.
+ * has them and the target host is the one that does not.  They are
+ * MANDATORY: without them this exits 2 and verifies nothing (until
+ * 2026-09-18 the halves were skipped and the test still passed), and the
+ * number of checks is asserted against the loop bounds so no path can
+ * quietly skip vectors.  PCMPESTRx sweeps all 256 control bytes (imm8[7]
+ * is reserved and ignored by the silicon — imm-tables.h), the 32-bit and
+ * the REX.W form, over the vector shapes of vectors.h.
  */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -30,6 +35,7 @@
 #include <sys/mman.h>
 #include "../preload/sse42emu.h"
 #include "imm-tables.h"
+#include "vectors.h"
 
 static int failures, checks;
 static uint64_t rng = 0x13198A2E03707344ULL;
@@ -102,7 +108,6 @@ RCONS
 
 static void check_aes(void)
 {
-    if (!have_aes()) { printf("  (no AES-NI here: AES differential skipped)\n"); return; }
     static const struct { const char *n; void (*hw)(uint8_t *, const uint8_t *); int op; }
     ops[] = {
         { "aesenc",     hw_aesenc,     SSE42EMU_AESENC     },
@@ -155,7 +160,6 @@ PCLMUL_IMMS
 
 static void check_pclmul(void)
 {
-    if (!have_pclmul()) { printf("  (no PCLMULQDQ here: differential skipped)\n"); return; }
     static const struct { uint8_t i; void (*hw)(uint8_t *, const uint8_t *, const uint8_t *); } v[] = {
 #define X(I) { (uint8_t) I, hw_pclmul_##I },
         PCLMUL_IMMS
@@ -188,7 +192,6 @@ static void hw_pcmpgtq(uint8_t d[16], const uint8_t a[16], const uint8_t b[16]) 
  * check it has ever had. */
 static void check_pcmpgtq(void)
 {
-    if (!have_sse42()) { printf("  (no SSE4.2 here: pcmpgtq differential skipped)\n"); return; }
     /* pcmpgtq %xmm2, %xmm1  =  66 0F 38 37 CA */
     static const uint8_t code[] = { 0x66, 0x0F, 0x38, 0x37, 0xCA };
     for (int t = 0; t < 20000; t++) {
@@ -238,11 +241,11 @@ static void estri_##IMM(const uint8_t *a, const uint8_t *b, int la, int lb,   \
                      : "a"(la), "d"(lb), "r"(a), "r"(b)                       \
                      : "xmm1", "xmm2", "rcx", "cc", "memory");                \
     *idx = i; *fl = f; }
-IMM_EXPAND_128
+IMM_EXPAND_256
 #undef X
-static estri_fn estri_tab[128] = {
+static estri_fn estri_tab[256] = {
 #define X(IMM) estri_##IMM,
-IMM_EXPAND_128
+IMM_EXPAND_256
 #undef X
 };
 
@@ -259,30 +262,22 @@ static void estrm_##IMM(const uint8_t *a, const uint8_t *b, int la, int lb,   \
                      : "a"(la), "d"(lb), "r"(a), "r"(b), "r"(mask)            \
                      : "xmm0", "xmm1", "xmm2", "cc", "memory");               \
     *fl = f; }
-IMM_EXPAND_128
+IMM_EXPAND_256
 #undef X
-static estrm_fn estrm_tab[128] = {
+static estrm_fn estrm_tab[256] = {
 #define X(IMM) estrm_##IMM,
-IMM_EXPAND_128
+IMM_EXPAND_256
 #undef X
 };
 
+#define N_ESTR 600                      /* shaped vectors, after the fixed edges */
 static void check_pcmpestr(void)
 {
-    if (!have_sse42()) { printf("  (no SSE4.2 here: pcmpestr differential skipped)\n"); return; }
-    /* Lengths worth sweeping: inside the vector, exactly at it, past it,
-     * zero, and negative (which the SDM defines as its magnitude). */
-    static const int lens[] = { 0, 1, 2, 3, 7, 8, 15, 16, 17, 40, -1, -5, -16, -17 };
-    const int nl = (int) (sizeof lens / sizeof *lens);
-    for (int t = 0; t < 600; t++) {
+    for (int t = 0; t < VEC_N_EDGE + N_ESTR; t++) {
         uint8_t a[16], b[16];
-        for (int i = 0; i < 16; i++) {
-            a[i] = (uint8_t) (rnd() % ((t % 3) ? 4 : 256));
-            b[i] = (uint8_t) (rnd() % ((t % 3) ? 4 : 256));
-        }
-        const int la = lens[(int) (rnd() % (uint64_t) nl)];
-        const int lb = lens[(int) (rnd() % (uint64_t) nl)];
-        for (int imm = 0; imm < 128; imm++) {
+        vec_pair(t, a, b);
+        const int la = vec_len(), lb = vec_len();
+        for (int imm = 0; imm < 256; imm++) {
             uint32_t ridx = 0, eidx = 0; uint64_t rfl = 0, efl = 0;
             estri_tab[imm](a, b, la, lb, &ridx, &rfl);
             sse42emu_pcmpestr(a, b, (uint8_t) imm, la, lb, &eidx, NULL, &efl);
@@ -311,6 +306,133 @@ static void check_pcmpestr(void)
     }
 }
 
+/* ---- PCMPESTRI / PCMPESTRM with REX.W: lengths from RAX/RDX ------- */
+/* GAS has no spelling for this form, so the bytes are given: 66 48 0F 3A
+ * 61|60 CA imm = pcmpestri|pcmpestrm $imm, %xmm2, %xmm1 with REX.W.  The
+ * emulator side runs the SAME bytes through sse42emu_step, because the
+ * width rule lives in the decoder plumbing, not in the int32 core. */
+typedef void (*estri64_fn)(const uint8_t *, const uint8_t *, int64_t, int64_t, uint32_t *, uint64_t *);
+typedef void (*estrm64_fn)(const uint8_t *, const uint8_t *, int64_t, int64_t, uint8_t *, uint64_t *);
+
+#define X(IMM)                                                                \
+static void estri64_##IMM(const uint8_t *a, const uint8_t *b, int64_t la, int64_t lb, \
+                          uint32_t *idx, uint64_t *fl) {                      \
+    uint64_t f; uint32_t i;                                                   \
+    __asm__ volatile("movdqu (%4), %%xmm1\n\t"                                \
+                     "movdqu (%5), %%xmm2\n\t"                                \
+                     ".byte 0x66,0x48,0x0f,0x3a,0x61,0xca\n\t.byte " #IMM "\n\t" \
+                     "mov %%ecx, %0\n\t"                                      \
+                     "pushfq\n\tpopq %1"                                      \
+                     : "=&r"(i), "=&r"(f)                                     \
+                     : "a"(la), "d"(lb), "r"(a), "r"(b)                       \
+                     : "xmm1", "xmm2", "rcx", "cc", "memory");                \
+    *idx = i; *fl = f; }
+IMM_EXPAND_256
+#undef X
+static estri64_fn estri64_tab[256] = {
+#define X(IMM) estri64_##IMM,
+IMM_EXPAND_256
+#undef X
+};
+
+#define X(IMM)                                                                \
+static void estrm64_##IMM(const uint8_t *a, const uint8_t *b, int64_t la, int64_t lb, \
+                          uint8_t *mask, uint64_t *fl) {                      \
+    uint64_t f;                                                               \
+    __asm__ volatile("movdqu (%3), %%xmm1\n\t"                                \
+                     "movdqu (%4), %%xmm2\n\t"                                \
+                     ".byte 0x66,0x48,0x0f,0x3a,0x60,0xca\n\t.byte " #IMM "\n\t" \
+                     "movdqu %%xmm0, (%5)\n\t"                                \
+                     "pushfq\n\tpopq %0"                                      \
+                     : "=&r"(f)                                               \
+                     : "a"(la), "d"(lb), "r"(a), "r"(b), "r"(mask)            \
+                     : "xmm0", "xmm1", "xmm2", "cc", "memory");               \
+    *fl = f; }
+IMM_EXPAND_256
+#undef X
+static estrm64_fn estrm64_tab[256] = {
+#define X(IMM) estrm64_##IMM,
+IMM_EXPAND_256
+#undef X
+};
+
+/* Lengths whose upper 32 bits matter: the .w form sees them, the 32-bit
+ * form must not. */
+static const int64_t lens64[] = { 5, -5, 0x100000003LL, -0x100000003LL, 0xffffffffLL, 0x100000000LL,
+                                  INT64_MIN, INT64_MAX, 0, 16, -16, 17 };
+#define N_LENS64 ((int) (sizeof lens64 / sizeof *lens64))
+
+/* Run the REX.W encoding through the emulator's decoder. */
+static int emu_estr64(const uint8_t a[16], const uint8_t b[16], int64_t la, int64_t lb, int imm, int mform,
+                      uint32_t *idx, uint8_t mask[16], uint64_t *fl)
+{
+    uint8_t code[7] = { 0x66, 0x48, 0x0f, 0x3a, (uint8_t) (mform ? 0x60 : 0x61), 0xca, (uint8_t) imm };
+    sse42emu_regs R; memset(&R, 0, sizeof R);
+    memcpy(R.xmm[1], a, 16); memcpy(R.xmm[2], b, 16);
+    R.gpr[REG_RAX] = (uint64_t) la; R.gpr[REG_RDX] = (uint64_t) lb;
+    R.rip = (uint64_t) (uintptr_t) code;
+    if (sse42emu_step(&R, code, sizeof code) != SSE42EMU_OK || R.rip != (uint64_t) (uintptr_t) code + 7)
+        return 0;
+    if (mform && R.xmm_written != 0) return 0;
+    *idx = (uint32_t) R.gpr[REG_RCX]; memcpy(mask, R.xmm[0], 16); *fl = R.rflags;
+    return 1;
+}
+
+#define N_ESTR64 200
+static void check_pcmpestr_rexw(void)
+{
+    for (int t = 0; t < N_ESTR64; t++) {
+        uint8_t a[16], b[16];
+        vec_shape(a, t); vec_shape(b, t);
+        const int64_t la = lens64[rnd() % N_LENS64], lb = lens64[rnd() % N_LENS64];
+        for (int imm = 0; imm < 256; imm++) {
+            uint32_t ridx = 0, eidx = 0; uint64_t rfl = 0, efl = 0; uint8_t rm[16], em[16];
+            estri64_tab[imm](a, b, la, lb, &ridx, &rfl);
+            checks++;
+            if (!emu_estr64(a, b, la, lb, imm, 0, &eidx, em, &efl) || ridx != eidx || (rfl & FLMASK) != (efl & FLMASK)) {
+                if (failures < 10) {
+                    printf("  pcmpestri.w imm=0x%02x la=%ld lb=%ld: hw idx=%u fl=%04lx  emu idx=%u fl=%04lx\n",
+                           imm, la, lb, ridx, rfl & FLMASK, eidx, efl & FLMASK);
+                    dump("a", a); dump("b", b);
+                }
+                failures++;
+            }
+            estrm64_tab[imm](a, b, la, lb, rm, &rfl);
+            checks++;
+            if (!emu_estr64(a, b, la, lb, imm, 1, &eidx, em, &efl) || memcmp(rm, em, 16) || (rfl & FLMASK) != (efl & FLMASK)) {
+                if (failures < 10) {
+                    printf("  pcmpestrm.w imm=0x%02x la=%ld lb=%ld: fl hw=%04lx emu=%04lx\n",
+                           imm, la, lb, rfl & FLMASK, efl & FLMASK);
+                    dump("a ", a); dump("b ", b); dump("hw", rm); dump("em", em);
+                }
+                failures++;
+            }
+        }
+    }
+
+    /* The .w and the 32-bit form must DIFFER on a length whose upper bits
+     * are set, or this whole function proves nothing: "cd" in "abcdef",
+     * la = 0x100000002 — 2 for the 32-bit form (a match at 2), saturated
+     * to 16 for .w (the needle becomes "cd" + 14 NULs, which is nowhere). */
+    {
+        uint8_t a[16] = "cd", b[16] = "abcdef";
+        uint32_t i32, i64, e32, e64; uint64_t f, ef; uint8_t m[16];
+        estri_tab[0x0c](a, b, (int) 0x100000002LL, 6, &i32, &f);
+        estri64_tab[0x0c](a, b, 0x100000002LL, 6, &i64, &f);
+        checks++;
+        if (!(i32 == 2 && i64 == 16)) { printf("  REX.W discriminator: hw 32-bit=%u .w=%u, want 2/16\n", i32, i64); failures++; }
+        e32 = 0; e64 = 0;
+        { uint8_t code[7] = { 0x66, 0x0f, 0x3a, 0x61, 0xca, 0x0c, 0xc3 };   /* the 32-bit form, 6 bytes */
+          sse42emu_regs R; memset(&R, 0, sizeof R);
+          memcpy(R.xmm[1], a, 16); memcpy(R.xmm[2], b, 16);
+          R.gpr[REG_RAX] = 0x100000002ULL; R.gpr[REG_RDX] = 6; R.rip = (uint64_t) (uintptr_t) code;
+          if (sse42emu_step(&R, code, 6) == SSE42EMU_OK) e32 = (uint32_t) R.gpr[REG_RCX]; }
+        emu_estr64(a, b, 0x100000002LL, 6, 0x0c, 0, &e64, m, &ef);
+        checks++;
+        if (!(e32 == 2 && e64 == 16)) { printf("  REX.W discriminator: emu 32-bit=%u .w=%u, want 2/16\n", e32, e64); failures++; }
+    }
+}
+
 /* ---- layer 2: the encoded instruction through sse42emu_step -------- */
 /* Every byte string below is `<insn> %xmm2, %xmm1`: ModRM CA = reg 001
  * (xmm1, the destination) and rm 010 (xmm2, the source).  The HARDWARE
@@ -327,15 +449,15 @@ static void check_pcmpestr(void)
  * the asm's own relocation. */
 uint8_t  g_a[16], g_b[16], g_x1[16], g_x0[16];
 uint64_t g_rcx, g_fl;
-uint32_t g_eax, g_edx;
+uint64_t g_rax, g_rdx;
 void   (*g_fn)(void);
 
 static void hw_run(void)
 {
     __asm__ volatile("movdqu g_a(%%rip), %%xmm1\n\t"
                      "movdqu g_b(%%rip), %%xmm2\n\t"
-                     "mov g_eax(%%rip), %%eax\n\t"
-                     "mov g_edx(%%rip), %%edx\n\t"
+                     "mov g_rax(%%rip), %%rax\n\t"
+                     "mov g_rdx(%%rip), %%rdx\n\t"
                      "call *g_fn(%%rip)\n\t"
                      "pushfq\n\tpopq g_fl(%%rip)\n\t"
                      "mov %%rcx, g_rcx(%%rip)\n\t"
@@ -367,32 +489,44 @@ static const struct site sites[] = {
     { "pcmpistri",       { 0x66,0x0F,0x3A,0x63,0xCA,0x00 }, 6, 0,0,1, -1, 1, 1 },
     { "pcmpestrm",       { 0x66,0x0F,0x3A,0x60,0xCA,0x40 }, 6, 0,0,1,  0, 0, 1 },
     { "pcmpestri",       { 0x66,0x0F,0x3A,0x61,0xCA,0x00 }, 6, 0,0,1, -1, 1, 1 },
+    /* REX.W: lengths from RAX/RDX (the bytes GAS cannot spell), and the
+     * reserved imm8[7] set on the index form */
+    { "pcmpestri.w",     { 0x66,0x48,0x0F,0x3A,0x61,0xCA,0x0C }, 7, 0,0,1, -1, 1, 1 },
+    { "pcmpestrm.w",     { 0x66,0x48,0x0F,0x3A,0x60,0xCA,0x40 }, 7, 0,0,1,  0, 0, 1 },
+    { "pcmpistri $0x8c", { 0x66,0x0F,0x3A,0x63,0xCA,0x8C },      6, 0,0,1, -1, 1, 1 },
 };
+static int dispatch_checks_per_iter(void)
+{
+    int n = 0;
+    for (unsigned k = 0; k < sizeof sites / sizeof *sites; k++)
+        n += 1 + (sites[k].writes_xmm >= 0) + sites[k].writes_ecx + sites[k].sets_flags;
+    return n;
+}
 
+#define N_DISPATCH 3000
 static void check_dispatch(void)
 {
     uint8_t *page = mmap(NULL, 4096, PROT_READ | PROT_WRITE | PROT_EXEC,
                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (page == MAP_FAILED) { printf("  (no RWX page: dispatch test skipped)\n"); return; }
 
-    for (int t = 0; t < 3000; t++) {
+    for (int t = 0; t < N_DISPATCH; t++) {
         fill(g_a); fill(g_b);
         if (t % 3) {                            /* short strings for the STR ops */
             for (int i = 0; i < 16; i++) { g_a[i] &= 3; g_b[i] &= 3; }
         }
         /* Explicit lengths, including the negative form the 32-bit
-         * encoding must sign-extend rather than read as 4 billion. */
-        const int32_t la = (t % 5 == 0) ? -5 : (int32_t) (t % 19) - 2;
-        const int32_t lb = (t % 7 == 0) ? -1 : (int32_t) (t % 23) - 3;
-        g_eax = (uint32_t) la;
-        g_edx = (uint32_t) lb;
+         * encoding must sign-extend rather than read as 4 billion, and —
+         * every 4th round — upper halves set, which only the .w sites may
+         * see (RAX carries them to both; the 32-bit sites must ignore them). */
+        int64_t la = (t % 5 == 0) ? -5 : (int64_t) (t % 19) - 2;
+        int64_t lb = (t % 7 == 0) ? -1 : (int64_t) (t % 23) - 3;
+        if ((t & 3) == 0) { la = (int64_t) (uint32_t) la | (1LL << 32); lb = (int64_t) (uint32_t) lb | (3LL << 32); }
+        g_rax = (uint64_t) la;
+        g_rdx = (uint64_t) lb;
 
         for (unsigned k = 0; k < sizeof sites / sizeof *sites; k++) {
             const struct site *S = &sites[k];
-            if ((S->need_aes && !have_aes()) ||
-                (S->need_pclmul && !have_pclmul()) ||
-                (S->need_sse42 && !have_sse42())) continue;
-
             uint8_t in_a[16], in_b[16];
             memcpy(in_a, g_a, 16); memcpy(in_b, g_b, 16);
 
@@ -404,8 +538,8 @@ static void check_dispatch(void)
             sse42emu_regs R; memset(&R, 0, sizeof R);
             memcpy(R.xmm[1], in_a, 16);
             memcpy(R.xmm[2], in_b, 16);
-            R.gpr[REG_RAX] = (uint64_t) (uint32_t) la;
-            R.gpr[REG_RDX] = (uint64_t) (uint32_t) lb;
+            R.gpr[REG_RAX] = (uint64_t) la;
+            R.gpr[REG_RDX] = (uint64_t) lb;
             R.rip = (uint64_t) (uintptr_t) S->code;
             checks++;
             if (sse42emu_step(&R, S->code, S->len) != SSE42EMU_OK) {
@@ -428,7 +562,7 @@ static void check_dispatch(void)
                 checks++;
                 if ((uint32_t) g_rcx != (uint32_t) R.gpr[REG_RCX]) {
                     if (failures < 10)
-                        printf("  %s: ecx hw=%u emu=%u (la=%d lb=%d)\n", S->name,
+                        printf("  %s: ecx hw=%u emu=%u (la=%ld lb=%ld)\n", S->name,
                                (uint32_t) g_rcx, (uint32_t) R.gpr[REG_RCX], la, lb);
                     failures++;
                 }
@@ -448,14 +582,27 @@ static void check_dispatch(void)
 
 int main(void)
 {
+    if (!have_sse42() || !have_aes() || !have_pclmul()) {
+        printf("test-vec: this machine lacks SSE4.2/AES-NI/PCLMULQDQ (%d/%d/%d) — the differential test cannot\n"
+               "          run here.  Build where the silicon is (lix-ory); nothing was verified.\n",
+               have_sse42(), have_aes(), have_pclmul());
+        return 2;
+    }
+    const int planned = 20000                               /* pcmpgtq */
+                      + 5000 * 5 + 2000 * 13                /* aes ops, aeskeygenassist */
+                      + 5000 * 4                            /* pclmulqdq */
+                      + (VEC_N_EDGE + N_ESTR) * 256 * 2     /* pcmpestri/m, 32-bit form */
+                      + N_ESTR64 * 256 * 2 + 2              /* REX.W form + the discriminator */
+                      + N_DISPATCH * dispatch_checks_per_iter();
     sse42emu_prepare();
-    printf("sse42emu vector test (host: sse42=%d aes=%d pclmul=%d)\n",
-           have_sse42(), have_aes(), have_pclmul());
+    printf("sse42emu vector test (host has sse4.2, aes-ni, pclmulqdq)\n");
     check_pcmpgtq();
     check_aes();
     check_pclmul();
     check_pcmpestr();
+    check_pcmpestr_rexw();
     check_dispatch();
     printf("%d checks, %d failures\n", checks, failures);
+    if (checks != planned) { printf("  ran %d checks, planned %d — a path skipped vectors\n", checks, planned); return 1; }
     return failures ? 1 : 0;
 }
