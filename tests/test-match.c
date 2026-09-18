@@ -71,12 +71,15 @@ static int our_mnemonic(ZydisMnemonic m, int *op)
 }
 
 /* The grammar's prefix rules, stated independently of the matcher: only
- * 66/F2/F3, at most four, not both F2 and F3, an optional REX immediately
+ * 66/F2/F3, at most four, not both F2 and F3, no 66 after an F2/F3 (the
+ * kernel's decoder cannot decode that order, so the emulator refuses it
+ * although the silicon and Zydis take it), an optional REX immediately
  * before 0F, nothing else in front of the opcode. */
 static int prefix_region_ok(const uint8_t *b, int n)
 {
     int i = 0, np = 0, f2 = 0, f3 = 0;
     while (i < n && (b[i] == 0x66 || b[i] == 0xf2 || b[i] == 0xf3)) {
+        if (b[i] == 0x66 && (f2 || f3)) return 0;
         if (b[i] == 0xf2) f2 = 1;
         if (b[i] == 0xf3) f3 = 1;
         i++; np++;

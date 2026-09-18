@@ -508,9 +508,10 @@ static void run_families(int lacking)
         static const uint8_t f2_istri[]    = { 0xF2, 0x66, 0x0F, 0x3A, 0x63, 0xC1, 0x00, 0xC3 }; /* F2 on the 66 group */
         static const uint8_t bare_b8[]     = { 0x0F, 0xB8, 0xC0, 0xC3 };                      /* popcnt without F3 */
         static const uint8_t movbe[]       = { 0x0F, 0x38, 0xF0, 0x00, 0xC3 };                /* movbe (%rax),%eax: F0 without F2 */
-        const uint8_t *bad[] = { lock_popcnt, vex_istri, f2_istri, bare_b8, movbe };
-        const char *badname[] = { "LOCK popcnt", "VEX vpcmpistri", "F2-prefixed pcmpistri", "0F B8 without F3", "MOVBE (0F 38 F0 without F2)" };
-        for (int k = 0; k < 5; k++) {
+        static const uint8_t f3_66[]       = { 0xF3, 0x66, 0x0F, 0xB8, 0xC1, 0xC3 };          /* 66 AFTER the mandatory F3: refused (the kernel decoder cannot decode it) */
+        const uint8_t *bad[] = { lock_popcnt, vex_istri, f2_istri, bare_b8, movbe, f3_66 };
+        const char *badname[] = { "LOCK popcnt", "VEX vpcmpistri", "F2-prefixed pcmpistri", "0F B8 without F3", "MOVBE (0F 38 F0 without F2)", "66 after the mandatory F3 (prefix order)" };
+        for (int k = 0; k < 6; k++) {
             st = run_child(child_exec_bytes, (void *) bad[k]);
             check(WIFSIGNALED(st) && WTERMSIG(st) == SIGILL, badname[k], "must die of SIGILL, status=%x", st);
             expect[F_UNHANDLED]++; expect_path[P_FALLBACK]++;

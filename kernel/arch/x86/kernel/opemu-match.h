@@ -17,8 +17,13 @@
  * address-size override, LOCK, anything VEX/EVEX/REX2 (C4 C5 62 D5 are not
  * prefixes below and fall out by themselves), more than four prefix bytes,
  * F2 and F3 together (hardware takes the last; the general path refuses the
- * pair, and the differential test knows this one exception), a REX that is
- * not immediately followed by 0F, and a buffer too short for the form.
+ * pair, and the differential test knows this exception), a 66 that comes
+ * AFTER an F2 or F3 (the silicon takes it as an operand-size prefix and
+ * executes POPCNT r16 / CRC32 r/m16 all the same, but the kernel's own
+ * decoder takes the LAST legacy prefix as the mandatory one and mis-decodes
+ * that order — no ModRM, length 4 — so the slow path could never handle it
+ * and neither path does; no compiler emits it), a REX that is not
+ * immediately followed by 0F, and a buffer too short for the form.
  */
 #ifndef OPEMU_MATCH_H
 #define OPEMU_MATCH_H
@@ -72,18 +77,22 @@ OPEMU_INLINE int opemu_match(const uint8_t *b, int n, struct opemu_insn *d)
 	int i = 0, np = 0, dispsz = 0;
 	uint8_t p66 = 0, pf2 = 0, pf3 = 0, rex = 0, has_rex = 0, op2, op3, m, mod, rm;
 
-	/* legacy prefixes: only the three that select among our opcodes */
+	/* legacy prefixes: only the three that select among our opcodes, and a
+	 * 66 only BEFORE the F2/F3 it may accompany (see the file comment) */
 	for (;;) {
 		if (i >= n)
 			return 0;
-		if (b[i] == 0x66)
+		if (b[i] == 0x66) {
+			if (pf2 || pf3)
+				return 0;
 			p66 = 1;
-		else if (b[i] == 0xf2)
+		} else if (b[i] == 0xf2) {
 			pf2 = 1;
-		else if (b[i] == 0xf3)
+		} else if (b[i] == 0xf3) {
 			pf3 = 1;
-		else
+		} else {
 			break;
+		}
 		if (++np > 4)
 			return 0;
 		i++;

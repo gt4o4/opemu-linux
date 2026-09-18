@@ -606,6 +606,14 @@ static enum opemu_op classify(const struct insn *insn, const struct prefixes *p)
 		return OPEMU_OP_NONE;
 	if (insn->opcode.nbytes < 2 || op[0] != 0x0f)
 		return OPEMU_OP_NONE;
+	/*
+	 * Every instruction of ours has a ModRM.  A decode without one is the
+	 * in-tree decoder picking the LAST legacy prefix as the mandatory one
+	 * (F3 66 0F B8: the 66 table has no POPCNT, attr 0, length 4) — an
+	 * instruction the silicon runs but this path cannot describe; refuse.
+	 */
+	if (!inat_has_modrm(insn->attr))
+		return OPEMU_OP_NONE;
 
 	if (insn->opcode.nbytes == 2) {
 		if (op[1] == 0xb8 && p->pf3 && !p->pf2)
