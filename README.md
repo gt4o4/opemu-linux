@@ -75,10 +75,34 @@ On the machine it was built for (Core 2 Duo E8435 at 3.06 GHz, Linux 6.18.50,
 | `agy --version` (~104k traps) | **200 ms**, against 300 ms via the preload and 3.70 s under `qemu-x86_64 -cpu Westmere` |
 | upstream claude-code `--version` (2,208 traps) | **0.19 s**, full interactive TUI |
 
-Roughly 60% of a POPCNT trap is the hardware exception entry/exit, which no
-software can remove; the rest is `insn_decode` plus the core.  The emulator
+Roughly 60% of a POPCNT trap was the hardware exception entry/exit, which no
+software can remove; the rest was `insn_decode` plus the core.  The emulator
 costs nothing when nothing traps — counters stay flat through ordinary
 desktop use, and `ud2` still dies of `SIGILL`.
+
+**Second kernel, same day (generation 307): the fast path and the SSE2 core**,
+from a `perf` profile of the first (2 M POPCNT + 2 M PCMPISTRI traps: 237 ns of
+hardware entry/exit, 96 ns of the in-tree decoder, 50 ns of glue, 8 ns of
+`irqentry`, and 447 ns of the scalar string core):
+
+| | first kernel | second kernel |
+|---|---|---|
+| POPCNT, per trap | 387 ns | **278 ns** |
+| PCMPISTRI (EqualOrdered), per trap | 872 ns | **323 ns** |
+| software per POPCNT trap, beside the ~230 ns hardware floor | ~150 ns | **~45 ns** |
+| PCMPxSTRx core, direct call (`bench-core`) | 2,245–4,420 cycles | **119–252 cycles** (17–19×; the spread is the P-state) |
+| crc32q / pclmulqdq / aesenc / aesdec, direct call | 897 / 419 / 432 / 3,627 cycles | **81 / 162 / 156 / 202** |
+| what `perf` sees on the fast path | `insn_decode_from_regs`, `inat_*`, `get_desc`, `rep_movs_alternative`, `_copy_from_user`, `__local_bh_enable_ip`, a `lock xadd` | none of them: `opemu_fixup_ud` 11%, `pcmpstr_core` 6%, `hweight64` 1%; ~75% is the hardware entry/`iretq` (`asm_exc_invalid_op`, `error_entry`, `sync_regs`) |
+| path split, 7 minutes of desktop use + 10 M bench traps | — | `path_fast` 15,053,329, `path_fallback` 1 (a `ud2`), `unhandled` 1 |
+| boot self-check | — | `77 vectors agree with the kernel's decoder` |
+| `agy --version` (~104k traps) | 200 ms | 190 ms (its traps were ~40 ms of that; now ~30) |
+| upstream claude-code 2.1.276 `--version` / TUI | 0.19 s / draws | 0.24 s / draws |
+
+What is left per trap is the hardware: `asm_exc_invalid_op` + `iretq` + the
+`sync_regs` copy of `pt_regs`, about 230 ns on this Core 2.  Only not
+trapping removes that — a first-fault patcher that rewrites hot sites to a
+veneer, for which this emulator (first execution, short sites) is the
+prerequisite.
 
 ### One thing this does not fix, and cannot
 
