@@ -20,6 +20,17 @@
  *   - a CPU model HAVING them (Westmere): the emulator must have stayed
  *     disabled, everything passes natively, every counter stays zero.
  *
+ * Since the fast path (opemu.c: interrupts off, own matcher, unsafe_get_user
+ * under pagefault_disable) every case also declares WHICH path must have
+ * served it, and the per-path counters are asserted exactly: the fast path
+ * for everything resident and in-grammar, the fallback for a segment or
+ * address-size override, an instruction window or an operand that reaches
+ * into a page that is not there — with the SIGSEGV address still exact —
+ * and a ud2 or refused encoding.  The boot self-check of the matcher
+ * against the kernel's decoder must have passed (selfcheck_ok 1) on both
+ * boots.  mlockall() first: every page of this binary becomes resident, so
+ * "fast" is deterministic and the only faults are the ones the test makes.
+ *
  * Output is TAP-ish on the serial console and ends with the marker the
  * derivation greps for: `OPEMU-SELFTEST: PASS` or `OPEMU-SELFTEST: FAIL`.
  */
@@ -39,6 +50,8 @@
 #include <sys/wait.h>
 #include <sys/reboot.h>
 #include <sys/sysmacros.h>
+#include <sys/syscall.h>
+#include <sys/ucontext.h>
 
 /* ---- families, in the order the kernel's stats file prints them ---- */
 enum { F_POPCNT, F_CRC32, F_PCMPGTQ, F_PCMPISTRI, F_PCMPISTRM, F_PCMPESTRI,
@@ -48,6 +61,17 @@ static const char *fam_name[F_NR] = {
     "popcnt", "crc32", "pcmpgtq", "pcmpistri", "pcmpistrm", "pcmpestri",
     "pcmpestrm", "pclmulqdq", "aes", "aeskeygen", "unhandled", "compat32", "segv" };
 static unsigned long expect[F_NR];          /* what we executed, per family */
+
+enum { P_FAST, P_FALLBACK, P_FETCH_FALLBACK, P_OPERAND_FALLBACK, P_NR };
+static const char *path_name[P_NR] = { "path_fast", "path_fallback", "path_fetch_fallback", "path_operand_fallback" };
+static unsigned long expect_path[P_NR];     /* which path must have served each of them */
+static int g_selfcheck = -1;
+
+/* Every instruction helper counts itself as served by the fast path; a case
+ * that must take the fallback moves its count over, naming why. */
+#define HIT(f) do { expect[f]++; expect_path[P_FAST]++; } while (0)
+static void took_fallback(int why)          /* why: -1 = the form, or P_FETCH_/P_OPERAND_FALLBACK */
+{ expect_path[P_FAST]--; expect_path[P_FALLBACK]++; if (why >= 0) expect_path[why]++; }
 
 static int failures, checks;
 
@@ -98,14 +122,18 @@ static int write_enable(int on)
     int r = write(fd, on ? "1\n" : "0\n", 2) == 2 ? 0 : -1; close(fd);
     return r;
 }
-static int read_stats(unsigned long got[F_NR])
+static int read_stats(unsigned long got[F_NR], unsigned long gotp[P_NR])
 {
     memset(got, 0, sizeof(unsigned long) * F_NR);
+    memset(gotp, 0, sizeof(unsigned long) * P_NR);
     FILE *f = fopen(STATS_PATH, "r");
     if (!f) return -1;
     char name[32]; unsigned long v; int seen = 0;
-    while (fscanf(f, "%31s %lu", name, &v) == 2)
+    while (fscanf(f, "%31s %lu", name, &v) == 2) {
         for (int i = 0; i < F_NR; i++) if (!strcmp(name, fam_name[i])) { got[i] = v; seen++; }
+        for (int i = 0; i < P_NR; i++) if (!strcmp(name, path_name[i])) gotp[i] = v;
+        if (!strcmp(name, "selfcheck_ok")) g_selfcheck = (int) v;
+    }
     fclose(f);
     return seen;
 }
@@ -115,28 +143,28 @@ static int read_stats(unsigned long got[F_NR])
 static uint64_t g_ripdata = 0xdeadbeefcafef00dULL;   /* RIP-relative operand */
 
 static uint64_t popcnt64(uint64_t v, uint64_t *fl)
-{ uint64_t r, f; __asm__ volatile("popcnt %2,%0\n\tpushfq\n\tpopq %1" : "=r"(r), "=r"(f) : "r"(v) : "cc"); expect[F_POPCNT]++; if (fl) *fl = f & FLMASK; return r; }
+{ uint64_t r, f; __asm__ volatile("popcnt %2,%0\n\tpushfq\n\tpopq %1" : "=r"(r), "=r"(f) : "r"(v) : "cc"); HIT(F_POPCNT); if (fl) *fl = f & FLMASK; return r; }
 static uint32_t popcnt32(uint32_t v)
-{ uint32_t r; __asm__ volatile("popcntl %1,%0" : "=r"(r) : "r"(v) : "cc"); expect[F_POPCNT]++; return r; }
+{ uint32_t r; __asm__ volatile("popcntl %1,%0" : "=r"(r) : "r"(v) : "cc"); HIT(F_POPCNT); return r; }
 static uint16_t popcnt16(uint16_t v)
-{ uint16_t r; __asm__ volatile("popcntw %1,%0" : "=r"(r) : "r"(v) : "cc"); expect[F_POPCNT]++; return r; }
+{ uint16_t r; __asm__ volatile("popcntw %1,%0" : "=r"(r) : "r"(v) : "cc"); HIT(F_POPCNT); return r; }
 static uint64_t popcnt_mem(const uint64_t *p)
-{ uint64_t r; __asm__ volatile("popcntq (%1),%0" : "=r"(r) : "r"(p) : "cc", "memory"); expect[F_POPCNT]++; return r; }
+{ uint64_t r; __asm__ volatile("popcntq (%1),%0" : "=r"(r) : "r"(p) : "cc", "memory"); HIT(F_POPCNT); return r; }
 static uint64_t popcnt_sib(const uint64_t *base, uint64_t idx)      /* [base+idx*8+0x1000] */
-{ uint64_t r; __asm__ volatile("popcntq 0x1000(%1,%2,8),%0" : "=r"(r) : "r"((uintptr_t) base - 0x1000), "r"(idx) : "cc", "memory"); expect[F_POPCNT]++; return r; }
+{ uint64_t r; __asm__ volatile("popcntq 0x1000(%1,%2,8),%0" : "=r"(r) : "r"((uintptr_t) base - 0x1000), "r"(idx) : "cc", "memory"); HIT(F_POPCNT); return r; }
 static uint64_t popcnt_rip(void)
-{ uint64_t r; __asm__ volatile("popcntq g_ripdata(%%rip),%0" : "=r"(r) : : "cc", "memory"); expect[F_POPCNT]++; return r; }
+{ uint64_t r; __asm__ volatile("popcntq g_ripdata(%%rip),%0" : "=r"(r) : : "cc", "memory"); HIT(F_POPCNT); return r; }
 static uint64_t popcnt_addr32(uint32_t addr)                        /* 67-prefixed */
-{ uint64_t r; __asm__ volatile("popcntq (%k1),%0" : "=r"(r) : "r"((uint64_t) addr) : "cc", "memory"); expect[F_POPCNT]++; return r; }   /* %k1 = 32-bit base -> GAS emits the 67 prefix */
+{ uint64_t r; __asm__ volatile("popcntq (%k1),%0" : "=r"(r) : "r"((uint64_t) addr) : "cc", "memory"); HIT(F_POPCNT); return r; }   /* %k1 = 32-bit base -> GAS emits the 67 prefix */
 
-static uint32_t crc32b(uint32_t c, uint8_t v)  { __asm__ volatile("crc32b %1,%0" : "+r"(c) : "r"(v)); expect[F_CRC32]++; return c; }
-static uint32_t crc32w(uint32_t c, uint16_t v) { __asm__ volatile("crc32w %1,%0" : "+r"(c) : "r"(v)); expect[F_CRC32]++; return c; }
-static uint32_t crc32l(uint32_t c, uint32_t v) { __asm__ volatile("crc32l %1,%0" : "+r"(c) : "r"(v)); expect[F_CRC32]++; return c; }
-static uint64_t crc32q(uint64_t c, uint64_t v) { __asm__ volatile("crc32q %1,%0" : "+r"(c) : "r"(v)); expect[F_CRC32]++; return c; }
+static uint32_t crc32b(uint32_t c, uint8_t v)  { __asm__ volatile("crc32b %1,%0" : "+r"(c) : "r"(v)); HIT(F_CRC32); return c; }
+static uint32_t crc32w(uint32_t c, uint16_t v) { __asm__ volatile("crc32w %1,%0" : "+r"(c) : "r"(v)); HIT(F_CRC32); return c; }
+static uint32_t crc32l(uint32_t c, uint32_t v) { __asm__ volatile("crc32l %1,%0" : "+r"(c) : "r"(v)); HIT(F_CRC32); return c; }
+static uint64_t crc32q(uint64_t c, uint64_t v) { __asm__ volatile("crc32q %1,%0" : "+r"(c) : "r"(v)); HIT(F_CRC32); return c; }
 static uint32_t crc32b_ah(uint32_t c, uint32_t eax_val)             /* the high-byte form Zydis hid */
-{ __asm__ volatile("crc32b %%ah,%%ecx" : "+c"(c) : "a"(eax_val)); expect[F_CRC32]++; return c; }   /* dest pinned to ECX: AH cannot meet a REX register */
+{ __asm__ volatile("crc32b %%ah,%%ecx" : "+c"(c) : "a"(eax_val)); HIT(F_CRC32); return c; }   /* dest pinned to ECX: AH cannot meet a REX register */
 static uint32_t crc32b_mem(uint32_t c, const uint8_t *p)
-{ __asm__ volatile("crc32b (%1),%0" : "+r"(c) : "r"(p) : "memory"); expect[F_CRC32]++; return c; }
+{ __asm__ volatile("crc32b (%1),%0" : "+r"(c) : "r"(p) : "memory"); HIT(F_CRC32); return c; }
 
 /* textbook reflected CRC-32C, the reference for the multi-byte forms */
 static uint32_t crc32c_ref(uint32_t crc, const void *buf, size_t n)
@@ -174,7 +202,7 @@ static const keygen_fn keygen[10] = { keygen_0x01, keygen_0x02, keygen_0x04, key
 static void expand_round(const uint8_t prev[16], uint8_t out[16], int i)
 {
     uint8_t t[16];
-    keygen[i](t, prev); expect[F_AESKEYGEN]++;
+    keygen[i](t, prev); HIT(F_AESKEYGEN);
     __asm__ volatile("movdqu (%1),%%xmm1\n\tmovdqu (%2),%%xmm2\n\t"
                      "pshufd $0xff,%%xmm2,%%xmm2\n\t"
                      "movdqa %%xmm1,%%xmm3\n\tpslldq $4,%%xmm3\n\tpxor %%xmm3,%%xmm1\n\t"
@@ -185,9 +213,9 @@ static void expand_round(const uint8_t prev[16], uint8_t out[16], int i)
 }
 
 static void pclmul_00(uint8_t d[16], const uint8_t a[16], const uint8_t b[16])
-{ __asm__ volatile("movdqu (%1),%%xmm1\n\tmovdqu (%2),%%xmm2\n\tpclmulqdq $0x00,%%xmm2,%%xmm1\n\tmovdqu %%xmm1,(%0)" : : "r"(d), "r"(a), "r"(b) : "xmm1", "xmm2", "memory"); expect[F_PCLMULQDQ]++; }
+{ __asm__ volatile("movdqu (%1),%%xmm1\n\tmovdqu (%2),%%xmm2\n\tpclmulqdq $0x00,%%xmm2,%%xmm1\n\tmovdqu %%xmm1,(%0)" : : "r"(d), "r"(a), "r"(b) : "xmm1", "xmm2", "memory"); HIT(F_PCLMULQDQ); }
 static void pclmul_11(uint8_t d[16], const uint8_t a[16], const uint8_t b[16])
-{ __asm__ volatile("movdqu (%1),%%xmm1\n\tmovdqu (%2),%%xmm2\n\tpclmulqdq $0x11,%%xmm2,%%xmm1\n\tmovdqu %%xmm1,(%0)" : : "r"(d), "r"(a), "r"(b) : "xmm1", "xmm2", "memory"); expect[F_PCLMULQDQ]++; }
+{ __asm__ volatile("movdqu (%1),%%xmm1\n\tmovdqu (%2),%%xmm2\n\tpclmulqdq $0x11,%%xmm2,%%xmm1\n\tmovdqu %%xmm1,(%0)" : : "r"(d), "r"(a), "r"(b) : "xmm1", "xmm2", "memory"); HIT(F_PCLMULQDQ); }
 
 #define ISTRI(name, imm, regs)                                                \
 static uint32_t name(const uint8_t a[16], const uint8_t b[16], uint64_t *fl) {\
@@ -197,27 +225,27 @@ static uint32_t name(const uint8_t a[16], const uint8_t b[16], uint64_t *fl) {\
                      "mov %%ecx,%0\n\tpushfq\n\tpopq %1"                      \
                      : "=&r"(i), "=&r"(f) : "r"(a), "r"(b)                    \
                      : "xmm" #regs, "xmm2", "rcx", "cc", "memory");           \
-    expect[F_PCMPISTRI]++; if (fl) *fl = f & FLMASK; return i; }
+    HIT(F_PCMPISTRI); if (fl) *fl = f & FLMASK; return i; }
 ISTRI(istri_any,     0x00, 1)     /* EqualAny, unsigned bytes, index of first match */
 ISTRI(istri_ordered, 0x0c, 1)     /* EqualOrdered: substring search */
 ISTRI(istri_ordered_hi, 0x0c, 9)  /* same, through xmm9 (REX.R on the reg field) */
 static uint32_t istri_mem(const uint8_t a[16], const uint8_t *b_mem)   /* m128 source */
-{ uint32_t i; __asm__ volatile("movdqu (%1),%%xmm1\n\tpcmpistri $0x0c,(%2),%%xmm1\n\tmov %%ecx,%0" : "=&r"(i) : "r"(a), "r"(b_mem) : "xmm1", "rcx", "cc", "memory"); expect[F_PCMPISTRI]++; return i; }
+{ uint32_t i; __asm__ volatile("movdqu (%1),%%xmm1\n\tpcmpistri $0x0c,(%2),%%xmm1\n\tmov %%ecx,%0" : "=&r"(i) : "r"(a), "r"(b_mem) : "xmm1", "rcx", "cc", "memory"); HIT(F_PCMPISTRI); return i; }
 static void istrm_any_mask(const uint8_t a[16], const uint8_t b[16], uint8_t out[16])
-{ __asm__ volatile("movdqu (%1),%%xmm1\n\tmovdqu (%2),%%xmm2\n\tpcmpistrm $0x40,%%xmm2,%%xmm1\n\tmovdqu %%xmm0,(%0)" : : "r"(out), "r"(a), "r"(b) : "xmm0", "xmm1", "xmm2", "cc", "memory"); expect[F_PCMPISTRM]++; }
+{ __asm__ volatile("movdqu (%1),%%xmm1\n\tmovdqu (%2),%%xmm2\n\tpcmpistrm $0x40,%%xmm2,%%xmm1\n\tmovdqu %%xmm0,(%0)" : : "r"(out), "r"(a), "r"(b) : "xmm0", "xmm1", "xmm2", "cc", "memory"); HIT(F_PCMPISTRM); }
 static uint32_t estri_ordered(const uint8_t a[16], const uint8_t b[16], int la, int lb, uint64_t *fl)
 { uint32_t i; uint64_t f;
   __asm__ volatile("movdqu (%4),%%xmm1\n\tmovdqu (%5),%%xmm2\n\tpcmpestri $0x0c,%%xmm2,%%xmm1\n\tmov %%ecx,%0\n\tpushfq\n\tpopq %1"
                    : "=&r"(i), "=&r"(f) : "a"(la), "d"(lb), "r"(a), "r"(b) : "xmm1", "xmm2", "rcx", "cc", "memory");
-  expect[F_PCMPESTRI]++; if (fl) *fl = f & FLMASK; return i; }
+  HIT(F_PCMPESTRI); if (fl) *fl = f & FLMASK; return i; }
 static uint32_t estri_ordered_rexw(const uint8_t a[16], const uint8_t b[16], int64_t la, int64_t lb)
 { uint32_t i;   /* 66 48 0F 3A 61 CA 0C = pcmpestri $0x0c,%xmm2,%xmm1 with REX.W: lengths from RAX/RDX */
   __asm__ volatile("movdqu (%3),%%xmm1\n\tmovdqu (%4),%%xmm2\n\t.byte 0x66,0x48,0x0f,0x3a,0x61,0xca,0x0c\n\tmov %%ecx,%0"
                    : "=&r"(i) : "a"(la), "d"(lb), "r"(a), "r"(b) : "xmm1", "xmm2", "rcx", "cc", "memory");
-  expect[F_PCMPESTRI]++; return i; }
+  HIT(F_PCMPESTRI); return i; }
 static void estrm_any_mask(const uint8_t a[16], const uint8_t b[16], int la, int lb, uint8_t out[16])
 { __asm__ volatile("movdqu (%1),%%xmm1\n\tmovdqu (%2),%%xmm2\n\tpcmpestrm $0x40,%%xmm2,%%xmm1\n\tmovdqu %%xmm0,(%0)"
-                   : : "r"(out), "r"(a), "r"(b), "a"(la), "d"(lb) : "xmm0", "xmm1", "xmm2", "cc", "memory"); expect[F_PCMPESTRM]++; }
+                   : : "r"(out), "r"(a), "r"(b), "a"(la), "d"(lb) : "xmm0", "xmm1", "xmm2", "cc", "memory"); HIT(F_PCMPESTRM); }
 
 /* ---- children that must die a particular way ------------------------ */
 static int run_child(void (*fn)(void *), void *arg)
@@ -251,12 +279,114 @@ static void child_protnone(void *a)
     volatile uint64_t r; __asm__ volatile("popcntq (%1),%0" : "=r"(r) : "r"(g_protnone) : "memory");
     _exit(44);                                           /* it returned: wrong */
 }
+/* Five bytes of `popcnt %rax,%rax` ending exactly at an unmapped page. */
+static void straddle_segv(int sig, siginfo_t *si, void *vuc)
+{
+    (void) sig;
+    ucontext_t *uc = vuc;
+    uint8_t *page = g_protnone;                          /* reused: the base of the two-page window */
+    if (si->si_addr == page + 4096 && (uint64_t) uc->uc_mcontext.gregs[REG_RIP] == (uint64_t) (uintptr_t) (page + 4096) &&
+        (uint64_t) uc->uc_mcontext.gregs[REG_RAX] == 42) _exit(45);
+    _exit(46);
+}
+static void child_fetch_straddle(void *a)
+{
+    (void) a;
+    uint8_t *two = mmap(NULL, 8192, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    munmap(two + 4096, 4096);
+    static const uint8_t code[] = { 0xF3, 0x48, 0x0F, 0xB8, 0xC0 };   /* popcnt %rax,%rax: bytes 4091..4095 */
+    memcpy(two + 4091, code, 5);
+    g_protnone = two;
+    struct sigaction sa; memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = straddle_segv; sa.sa_flags = SA_SIGINFO;
+    sigaction(SIGSEGV, &sa, NULL);
+    __asm__ volatile("mov %0,%%rax\n\tjmp *%1" : : "r"(0xdeadbeefcafef00dULL), "r"(two + 4091) : "rax", "memory");
+    _exit(47);
+}
+static void operand_segv(int sig, siginfo_t *si, void *uc)
+{ (void) sig; (void) uc; _exit(si->si_addr == (uint8_t *) g_protnone + 4096 ? 42 : 43); }
+static void child_operand_straddle(void *a)
+{
+    int which = *(int *) a;
+    uint8_t *two = mmap(NULL, 8192, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    memset(two, 0x5a, 4096);
+    munmap(two + 4096, 4096);
+    g_protnone = two;
+    struct sigaction sa; memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = operand_segv; sa.sa_flags = SA_SIGINFO;
+    sigaction(SIGSEGV, &sa, NULL);
+    volatile uint64_t r;
+    if (which == 0) __asm__ volatile("popcntq (%1),%0" : "=r"(r) : "r"(two + 4093) : "cc", "memory");
+    else { uint8_t nd[16] = "needle"; uint32_t i;
+           __asm__ volatile("movdqu (%1),%%xmm1\n\tpcmpistri $0x0c,(%2),%%xmm1\n\tmov %%ecx,%0" : "=&r"(i) : "r"(nd), "r"(two + 4090) : "xmm1", "rcx", "cc", "memory"); r = i; }
+    _exit(44);                                           /* it returned: wrong */
+}
+
+/* All sixteen XMM registers loaded with distinct patterns, one string
+ * instruction, all sixteen stored back. */
+#define XMM_LOAD_ALL(p)  "movdqu 0(" p "),%%xmm0\n\tmovdqu 16(" p "),%%xmm1\n\tmovdqu 32(" p "),%%xmm2\n\tmovdqu 48(" p "),%%xmm3\n\t" \
+                         "movdqu 64(" p "),%%xmm4\n\tmovdqu 80(" p "),%%xmm5\n\tmovdqu 96(" p "),%%xmm6\n\tmovdqu 112(" p "),%%xmm7\n\t" \
+                         "movdqu 128(" p "),%%xmm8\n\tmovdqu 144(" p "),%%xmm9\n\tmovdqu 160(" p "),%%xmm10\n\tmovdqu 176(" p "),%%xmm11\n\t" \
+                         "movdqu 192(" p "),%%xmm12\n\tmovdqu 208(" p "),%%xmm13\n\tmovdqu 224(" p "),%%xmm14\n\tmovdqu 240(" p "),%%xmm15\n\t"
+#define XMM_STORE_ALL(p) "movdqu %%xmm0,0(" p ")\n\tmovdqu %%xmm1,16(" p ")\n\tmovdqu %%xmm2,32(" p ")\n\tmovdqu %%xmm3,48(" p ")\n\t" \
+                         "movdqu %%xmm4,64(" p ")\n\tmovdqu %%xmm5,80(" p ")\n\tmovdqu %%xmm6,96(" p ")\n\tmovdqu %%xmm7,112(" p ")\n\t" \
+                         "movdqu %%xmm8,128(" p ")\n\tmovdqu %%xmm9,144(" p ")\n\tmovdqu %%xmm10,160(" p ")\n\tmovdqu %%xmm11,176(" p ")\n\t" \
+                         "movdqu %%xmm12,192(" p ")\n\tmovdqu %%xmm13,208(" p ")\n\tmovdqu %%xmm14,224(" p ")\n\tmovdqu %%xmm15,240(" p ")\n\t"
+#define XMM_CLOBBERS "xmm0","xmm1","xmm2","xmm3","xmm4","xmm5","xmm6","xmm7","xmm8","xmm9","xmm10","xmm11","xmm12","xmm13","xmm14","xmm15"
+static uint32_t xmm_all(const uint8_t in[16][16], uint8_t out[16][16], int which, int64_t la, int64_t lb)
+{
+    uint32_t i = 0;
+    switch (which) {
+    case 0: __asm__ volatile(XMM_LOAD_ALL("%1") "pcmpistri $0x0c,%%xmm2,%%xmm1\n\tmov %%ecx,%0\n\t" XMM_STORE_ALL("%2")
+                             : "=&r"(i) : "r"(in), "r"(out) : XMM_CLOBBERS, "rcx", "cc", "memory"); HIT(F_PCMPISTRI); break;
+    case 1: __asm__ volatile(XMM_LOAD_ALL("%0") "pcmpistrm $0x40,%%xmm2,%%xmm1\n\t" XMM_STORE_ALL("%1")
+                             : : "r"(in), "r"(out) : XMM_CLOBBERS, "cc", "memory"); HIT(F_PCMPISTRM); break;
+    case 2: __asm__ volatile(XMM_LOAD_ALL("%1") "pcmpestri $0x0c,%%xmm2,%%xmm1\n\tmov %%ecx,%0\n\t" XMM_STORE_ALL("%2")
+                             : "=&r"(i) : "r"(in), "r"(out), "a"(la), "d"(lb) : XMM_CLOBBERS, "rcx", "cc", "memory"); HIT(F_PCMPESTRI); break;
+    case 3: __asm__ volatile(XMM_LOAD_ALL("%0") "pcmpestrm $0x40,%%xmm2,%%xmm1\n\t" XMM_STORE_ALL("%1")
+                             : : "r"(in), "r"(out), "a"(la), "d"(lb) : XMM_CLOBBERS, "cc", "memory"); HIT(F_PCMPESTRM); break;
+    default: __asm__ volatile(XMM_LOAD_ALL("%1") "pcmpistri $0x0c,%%xmm14,%%xmm13\n\tmov %%ecx,%0\n\t" XMM_STORE_ALL("%2")
+                             : "=&r"(i) : "r"(in), "r"(out) : XMM_CLOBBERS, "rcx", "cc", "memory"); HIT(F_PCMPISTRI); break;
+    }
+    return i;
+}
+static void check_xmm_preserved(void)
+{
+    uint8_t in[16][16], out[16][16];
+    for (int r = 0; r < 16; r++) for (int j = 0; j < 16; j++) in[r][j] = (uint8_t) (0x11 * r + 7 * j + 1);
+    memset(in[1], 0, 16); memcpy(in[1], "cd", 2);          /* xmm1 = needle, xmm2 = haystack for the I forms */
+    memset(in[2], 0, 16); memcpy(in[2], "abcdef", 6);
+    memset(in[13], 0, 16); memcpy(in[13], "cd", 2);        /* operands INSIDE the kernel's scratch set */
+    memset(in[14], 0, 16); memcpy(in[14], "abcdef", 6);
+    static const char *what[5] = { "pcmpistri", "pcmpistrm", "pcmpestri", "pcmpestrm", "pcmpistri on xmm13/xmm14" };
+    for (int which = 0; which < 5; which++) {
+        memset(out, 0xee, sizeof out);
+        uint32_t i = xmm_all(in, out, which, 2, 6);
+        int intact = 1, first = -1;
+        for (int r = 0; r < 16; r++) {
+            if ((which == 1 || which == 3) && r == 0) continue;   /* the M forms write xmm0 */
+            if (memcmp(in[r], out[r], 16)) { intact = 0; if (first < 0) first = r; }
+        }
+        char name[96]; snprintf(name, sizeof name, "%s leaves every other XMM register intact", what[which]);
+        check(intact, name, "xmm%d changed", first);
+        if (which == 0 || which == 2 || which == 4) check(i == 2, what[which], "index %u, want 2", i);
+        else { /* mask of 'c' or 'd' in "abcdef", EqualAny with 0x40: bytes 2 and 3 */
+            uint8_t want[16] = {0}; want[2] = 0xff; want[3] = 0xff;
+            /* the needle "cd" as EqualAny: b[j] in {c,d} */
+            check(!memcmp(out[0], want, 16), which == 1 ? "pcmpistrm $0x40 mask lands in xmm0" : "pcmpestrm $0x40 mask lands in xmm0", ""); }
+    }
+}
+static uint32_t istri_words(const uint8_t a[16], const uint8_t b[16])   /* imm 0x0d: uword, EqualOrdered */
+{ uint32_t i; __asm__ volatile("movdqu (%1),%%xmm1\n\tmovdqu (%2),%%xmm2\n\tpcmpistri $0x0d,%%xmm2,%%xmm1\n\tmov %%ecx,%0" : "=&r"(i) : "r"(a), "r"(b) : "xmm1", "xmm2", "rcx", "cc", "memory"); HIT(F_PCMPISTRI); return i; }
+static uint32_t istri_sranges(const uint8_t a[16], const uint8_t b[16]) /* imm 0x06: sbyte, Ranges */
+{ uint32_t i; __asm__ volatile("movdqu (%1),%%xmm1\n\tmovdqu (%2),%%xmm2\n\tpcmpistri $0x06,%%xmm2,%%xmm1\n\tmov %%ecx,%0" : "=&r"(i) : "r"(a), "r"(b) : "xmm1", "xmm2", "rcx", "cc", "memory"); HIT(F_PCMPISTRI); return i; }
+
 static void *thread_blocked_popcnt(void *arg)
 {
     sigset_t all; sigfillset(&all);
     pthread_sigmask(SIG_SETMASK, &all, NULL);          /* what bun does */
     uint64_t r; __asm__ volatile("popcnt %1,%0" : "=r"(r) : "r"(0xdeadbeefcafef00dULL) : "cc");
-    expect[F_POPCNT]++;
+    HIT(F_POPCNT);
     *(uint64_t *) arg = r;
     return NULL;
 }
@@ -273,9 +403,22 @@ static void run_families(int lacking)
     check(popcnt_mem(arr) == 42, "popcnt [base]", "");
     check(popcnt_sib(arr, 1) == 8 && popcnt_sib(arr, 3) == 2, "popcnt [base+idx*8+disp32]", "");
     check(popcnt_rip() == 42, "popcnt RIP-relative", "");
-    if ((uintptr_t) &g_ripdata < 0x100000000ULL)
+    if ((uintptr_t) &g_ripdata < 0x100000000ULL) {
         check(popcnt_addr32((uint32_t) (uintptr_t) &g_ripdata) == 42, "popcnt addr32 (67 prefix)", "");
-    else say("# skip addr32: data above 4G\n");
+        took_fallback(-1);
+    } else say("# skip addr32: data above 4G\n");
+
+    /* segment-based operands: FS holds the TCB self-pointer, GS is set by us */
+    { uint64_t tcb, r;
+      __asm__ volatile("mov %%fs:0,%0" : "=r"(tcb));
+      __asm__ volatile("popcntq %%fs:0,%0" : "=r"(r) : : "cc", "memory"); HIT(F_POPCNT); took_fallback(-1);
+      check(r == (uint64_t) __builtin_popcountll(tcb), "popcnt %%fs:0 (FS base, via the fallback)", "r=%lu tcb=%lx", r, tcb);
+      static uint64_t gsbuf[2] = { 0, 0xf0f0f0f0f0f0f0f0ULL };
+      if (syscall(SYS_arch_prctl, 0x1001 /* ARCH_SET_GS */, (unsigned long) gsbuf) == 0) {
+          __asm__ volatile("popcntq %%gs:8,%0" : "=r"(r) : : "cc", "memory"); HIT(F_POPCNT); took_fallback(-1);
+          check(r == 32, "popcnt %%gs:8 (GS base, via the fallback)", "r=%lu", r);
+          syscall(SYS_arch_prctl, 0x1001, 0UL);
+      } else say("# skip GS: arch_prctl failed\n"); }
 
     uint32_t c = 0xffffffffu;
     for (const char *s = "123456789"; *s; s++) c = crc32b(c, (uint8_t) *s);
@@ -288,7 +431,7 @@ static void run_families(int lacking)
     { uint8_t one = 0x5A; check(crc32b_mem(1u, &one) == crc32c_ref(1u, &one, 1), "crc32b [mem]", ""); }
 
     { uint8_t a[16], b[16]; int64_t x[2] = { 5, -1 }, y[2] = { 3, 2 };
-      memcpy(a, x, 16); memcpy(b, y, 16); op_pcmpgtq(a, b); expect[F_PCMPGTQ]++;
+      memcpy(a, x, 16); memcpy(b, y, 16); op_pcmpgtq(a, b); HIT(F_PCMPGTQ);
       uint64_t lo, hi; memcpy(&lo, a, 8); memcpy(&hi, a + 8, 8);
       check(lo == ~0ULL && hi == 0, "pcmpgtq {5,-1} > {3,2} = {~0,0}", "lo=%lx hi=%lx", lo, hi); }
 
@@ -301,14 +444,14 @@ static void run_families(int lacking)
       for (int i = 1; i <= 10; i++) expand_round(rk[i - 1], rk[i], i - 1);
       memcpy(st, pt, 16);
       for (int i = 0; i < 16; i++) st[i] ^= rk[0][i];
-      for (int r = 1; r <= 9; r++) { op_aesenc(st, rk[r]); expect[F_AES]++; }
-      op_aesenclast(st, rk[10]); expect[F_AES]++;
+      for (int r = 1; r <= 9; r++) { op_aesenc(st, rk[r]); HIT(F_AES); }
+      op_aesenclast(st, rk[10]); HIT(F_AES);
       check(!memcmp(st, ct, 16), "AES-128 encrypt FIPS-197 C.1 (10 keygenassist, 9 aesenc, 1 aesenclast)", "");
       memcpy(dk[0], rk[10], 16); memcpy(dk[10], rk[0], 16);
-      for (int r = 1; r <= 9; r++) { op_aesimc(dk[r], rk[10 - r]); expect[F_AES]++; }
+      for (int r = 1; r <= 9; r++) { op_aesimc(dk[r], rk[10 - r]); HIT(F_AES); }
       for (int i = 0; i < 16; i++) st[i] ^= dk[0][i];
-      for (int r = 1; r <= 9; r++) { op_aesdec(st, dk[r]); expect[F_AES]++; }
-      op_aesdeclast(st, dk[10]); expect[F_AES]++;
+      for (int r = 1; r <= 9; r++) { op_aesdec(st, dk[r]); HIT(F_AES); }
+      op_aesdeclast(st, dk[10]); HIT(F_AES);
       check(!memcmp(st, pt, 16), "AES-128 decrypt back to plaintext (9 aesimc, 9 aesdec, 1 aesdeclast)", ""); }
 
     { uint8_t a[16] = {0}, b[16] = {0}, d[16]; a[0] = 3; b[0] = 7; a[8] = 3; b[8] = 7;
@@ -342,6 +485,7 @@ static void run_families(int lacking)
     /* mechanism: an operand on a page that has never been touched */
     { uint64_t *fresh = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
       check(popcnt_mem(fresh) == 0, "popcnt on a never-touched anonymous page (pages in, reads 0)", "");
+      took_fallback(P_OPERAND_FALLBACK);                 /* not present -> the fallback paged it in */
       uint8_t z8[8] = {0};
       check(crc32q(0x77ULL, 0) == crc32c_ref(0x77u, z8, 8) && crc32b_mem(0x77u, (uint8_t *) fresh + 4090) == crc32c_ref(0x77u, z8, 1),
             "crc32 on the fresh page, tail byte", ""); }
@@ -355,10 +499,10 @@ static void run_families(int lacking)
         handled = 0;
         st = run_child(child_protnone, &handled);
         check(WIFSIGNALED(st) && WTERMSIG(st) == SIGSEGV, "PROT_NONE operand, no handler -> killed by SIGSEGV", "status=%x", st);
-        expect[F_SEGV] += 2;
+        expect[F_SEGV] += 2; expect_path[P_FALLBACK] += 2; expect_path[P_OPERAND_FALLBACK] += 2;
         st = run_child(child_ud2, NULL);
         check(WIFSIGNALED(st) && WTERMSIG(st) == SIGILL, "ud2 still dies of SIGILL (pass-through)", "status=%x", st);
-        expect[F_UNHANDLED]++;
+        expect[F_UNHANDLED]++; expect_path[P_FALLBACK]++;
         static const uint8_t lock_popcnt[] = { 0xF0, 0xF3, 0x0F, 0xB8, 0xC0, 0xC3 };          /* lock popcnt %eax,%eax */
         static const uint8_t vex_istri[]   = { 0xC4, 0xE3, 0x79, 0x63, 0xC1, 0x00, 0xC3 };    /* vpcmpistri $0,%xmm1,%xmm0 */
         static const uint8_t f2_istri[]    = { 0xF2, 0x66, 0x0F, 0x3A, 0x63, 0xC1, 0x00, 0xC3 }; /* F2 on the 66 group */
@@ -369,9 +513,53 @@ static void run_families(int lacking)
         for (int k = 0; k < 5; k++) {
             st = run_child(child_exec_bytes, (void *) bad[k]);
             check(WIFSIGNALED(st) && WTERMSIG(st) == SIGILL, badname[k], "must die of SIGILL, status=%x", st);
-            expect[F_UNHANDLED]++;
+            expect[F_UNHANDLED]++; expect_path[P_FALLBACK]++;
         }
+
+        /* the instruction window reaches into a page that is not there:
+         * emulated anyway (the fallback fetches what is mapped), then the
+         * NEXT instruction is on the missing page and that is the SIGSEGV */
+        st = run_child(child_fetch_straddle, NULL);
+        check(WIFEXITED(st) && WEXITSTATUS(st) == 45, "popcnt in the last 5 bytes before an unmapped page: emulated, SIGSEGV at the next ip", "status=%x", st);
+        HIT(F_POPCNT); took_fallback(P_FETCH_FALLBACK);
+
+        /* an operand that straddles into a page that is not there: the
+         * SIGSEGV names the first missing byte, exactly */
+        int which = 0;
+        st = run_child(child_operand_straddle, &which);
+        check(WIFEXITED(st) && WEXITSTATUS(st) == 42, "popcntq 3 bytes before an unmapped page -> SIGSEGV at the page", "status=%x", st);
+        which = 1;
+        st = run_child(child_operand_straddle, &which);
+        check(WIFEXITED(st) && WEXITSTATUS(st) == 42, "pcmpistri m128 6 bytes before an unmapped page -> SIGSEGV at the page", "status=%x", st);
+        expect[F_SEGV] += 2; expect_path[P_FALLBACK] += 2; expect_path[P_OPERAND_FALLBACK] += 2;
     }
+
+    /* the same windows entirely inside mapped memory stay on the fast path */
+    { uint8_t *two = mmap(NULL, 8192, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+      memset(two, 0x90, 8192);                            /* both pages present */
+      static const uint8_t code[] = { 0xF3, 0x48, 0x0F, 0xB8, 0xC0, 0xC3 };   /* popcnt %rax,%rax ; ret */
+      memcpy(two + 4093, code, sizeof code);              /* bytes 4093..4098: across the page boundary, both mapped */
+      uint64_t r;
+      __asm__ volatile("mov %1,%%rax\n\tcall *%2\n\tmov %%rax,%0" : "=&r"(r) : "r"(0xdeadbeefcafef00dULL), "r"(two + 4093) : "rax", "rcx", "rdx", "cc", "memory");
+      HIT(F_POPCNT);
+      check(r == 42, "popcnt straddling two MAPPED pages (fetch window crosses, both resident): fast", "r=%lu", r);
+      memset(two + 4080, 0, 16); memcpy(two + 4080, "abcdef", 6);
+      uint8_t sub[16] = "cd";
+      check(istri_mem(sub, two + 4080) == 2, "pcmpistri m128 in the last 16 bytes of a mapped page: fast", "");
+      uint64_t v = 0xffULL; memcpy(two + 4088, &v, 8);
+      check(popcnt_mem((uint64_t *) (two + 4088)) == 8, "popcnt m64 in the last 8 bytes of a mapped page: fast", "");
+      munmap(two, 8192); }
+
+    /* the XMM registers around the string instructions: every register the
+     * instruction does not write must come back untouched (the kernel's core
+     * borrows scratch XMM registers and must restore them) */
+    check_xmm_preserved();
+
+    /* word format and a signed range: the two format axes the byte cases miss */
+    { uint8_t a[16] = { 'c', 0, 'd', 0 }, b[16] = { 'a', 0, 'b', 0, 'c', 0, 'd', 0, 'e', 0, 'f', 0 };
+      check(istri_words(a, b) == 2, "pcmpistri $0x0d: UTF-16 \"cd\" in \"abcdef\" -> word 2", "");
+      uint8_t ra[16] = { 0xf0, 0x10 }, rb[16] = { 0x40, 0xfc };
+      check(istri_sranges(ra, rb) == 1, "pcmpistri $0x06: signed range [-16,16] catches -4 at 1 (unsigned would give 16)", ""); }
 }
 
 int main(void)
@@ -390,6 +578,8 @@ int main(void)
     const int lacking = !cpu_has_all();
     uint32_t ecx; cpuid1(&ecx);
     say("# opemu selftest: cpuid.1:ecx=%08x -> CPU %s the emulated features\n", ecx, lacking ? "LACKS" : "HAS ALL");
+    /* every page of this binary resident: the fast path is then deterministic */
+    check(mlockall(MCL_CURRENT) == 0, "mlockall(MCL_CURRENT)", "failed");
 
     int en = read_enable();
     check(en >= 0, "kernel has CONFIG_X86_UD_EMULATE (" ENABLE_PATH " exists)", "missing");
@@ -407,14 +597,23 @@ int main(void)
     g_protnone = mmap(NULL, 4096, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     run_families(lacking);
 
-    unsigned long got[F_NR];
-    int seen = read_stats(got);
+    unsigned long got[F_NR], gotp[P_NR];
+    int seen = read_stats(got, gotp);
     check(seen == F_NR, "stats file lists every counter", "seen %d of %d", seen, F_NR);
     for (int i = 0; i < F_NR; i++) {
         unsigned long want = lacking ? expect[i] : 0;
         check(got[i] == want, fam_name[i], "counter %lu, expected exactly %lu", got[i], want);
     }
-    say("# stats:"); for (int i = 0; i < F_NR; i++) say(" %s=%lu", fam_name[i], got[i]); say("\n");
+    for (int i = 0; i < P_NR; i++) {
+        unsigned long want = lacking ? expect_path[i] : 0;
+        check(gotp[i] == want, path_name[i], "counter %lu, expected exactly %lu", gotp[i], want);
+    }
+    { unsigned long served = 0; for (int i = 0; i < F_NR; i++) if (i != F_COMPAT32) served += got[i];
+      check(gotp[P_FAST] + gotp[P_FALLBACK] == served, "every served trap took exactly one path", "%lu + %lu != %lu", gotp[P_FAST], gotp[P_FALLBACK], served); }
+    check(g_selfcheck == 1, "boot self-check of the matcher against the kernel's decoder passed", "selfcheck_ok=%d", g_selfcheck);
+    say("# stats:"); for (int i = 0; i < F_NR; i++) say(" %s=%lu", fam_name[i], got[i]);
+    for (int i = 0; i < P_NR; i++) say(" %s=%lu", path_name[i], gotp[i]);
+    say("\n");
 
 done:
     say("# %d checks, %d failures\n", checks, failures);

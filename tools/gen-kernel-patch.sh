@@ -2,7 +2,8 @@
 # Emit dist/linux-6.18-opemu.patch: the ONE artefact a kernel build consumes.
 #
 #   kernel/hook.patch            hand-maintained hunks (Kconfig, kernel/Makefile, traps.c)
-#   kernel/arch/x86/...          new kernel files, verbatim
+#   kernel/arch/x86/...          new kernel files, verbatim (opemu.c, the matcher
+#                                opemu-match.h + its vectors, asm/opemu.h)
 #   core/emu-core.{c,h}          copied in as arch/x86/kernel/opemu-core.{c,h}
 #
 # The core is COPIED, not referenced, so the kernel tree stays self-contained
@@ -17,6 +18,8 @@ trap 'rm -rf "$stage"' EXIT
 
 mkdir -p "$stage/b/arch/x86/kernel" "$stage/b/arch/x86/include/asm"
 cp "$here/kernel/arch/x86/kernel/opemu.c"       "$stage/b/arch/x86/kernel/opemu.c"
+cp "$here/kernel/arch/x86/kernel/opemu-match.h" "$stage/b/arch/x86/kernel/opemu-match.h"
+cp "$here/kernel/arch/x86/kernel/opemu-match-vectors.h" "$stage/b/arch/x86/kernel/opemu-match-vectors.h"
 cp "$here/kernel/arch/x86/include/asm/opemu.h"  "$stage/b/arch/x86/include/asm/opemu.h"
 # the shared core, with its include rewritten to the flat kernel layout
 sed 's|#include "emu-core.h"|#include "opemu-core.h"|' "$here/core/emu-core.c" > "$stage/b/arch/x86/kernel/opemu-core.c"
@@ -28,7 +31,8 @@ cp "$here/core/emu-core.h" "$stage/b/arch/x86/kernel/opemu-core.h"
   echo
   cat "$here/kernel/hook.patch"
   cd "$stage"
-  for f in arch/x86/include/asm/opemu.h arch/x86/kernel/opemu-core.h arch/x86/kernel/opemu-core.c arch/x86/kernel/opemu.c; do
+  for f in arch/x86/include/asm/opemu.h arch/x86/kernel/opemu-core.h arch/x86/kernel/opemu-core.c \
+           arch/x86/kernel/opemu-match.h arch/x86/kernel/opemu-match-vectors.h arch/x86/kernel/opemu.c; do
     # --label twice: headers carry the paths only, never an mtime — the
     # output must be byte-identical wherever it is regenerated (a nix
     # sandbox unpacks this tree with epoch timestamps).

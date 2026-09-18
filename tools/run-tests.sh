@@ -7,7 +7,7 @@
 #
 # Zydis is linked statically from $ZYDIS/lib/libZydis.a + $ZYCORE/lib/libZycore.a.
 # test-emu, test-vec and test-gpr need real SSE4.2/AES-NI/PCLMULQDQ and exit 2
-# without them; test-ref runs on any x86-64.
+# without them; test-ref and test-match run on any x86-64.
 set -euo pipefail
 here=$(cd "$(dirname "$0")/.." && pwd)
 cmd=${1:-all}
@@ -30,11 +30,13 @@ build() {
   done
   # the core against the scalar reference: no Zydis, no silicon
   $CC "${cflags[@]}" -o "$out/test-ref" tests/test-ref.c tests/pcmpstr-ref.c core/emu-core.c
+  # the kernel's instruction matcher against Zydis: no silicon needed
+  $CC "${cflags[@]}" "${inc[@]}" -o "$out/test-match" tests/test-match.c "${libs[@]}"
 }
 
 run() {
   local status=0 t
-  for t in test-emu test-vec test-gpr test-ref; do
+  for t in test-emu test-vec test-gpr test-ref test-match; do
     echo "== $t"
     if ! "$out/$t"; then echo "== $t FAILED"; status=1; fi
   done
