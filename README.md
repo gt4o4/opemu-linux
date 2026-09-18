@@ -41,6 +41,45 @@ negative control), `opemu.trace=1` to log refused `#UD` sites, and
 sites emulated.  32-bit processes are refused (counted as `compat32`).  As
 with UMIP, an emulated instruction raises no `#DB` under `TF`.
 
+## Measured
+
+On the machine it was built for (Core 2 Duo E8435 at 3.06 GHz, Linux 6.18.50,
+`-march=core2 -O3`), first boot 2026-09-18:
+
+| | |
+|---|---|
+| POPCNT, per trap | **378 ns** |
+| PCMPISTRI, per trap | **855 ns** |
+| the same through a userspace `SIGILL` handler | ~3 µs |
+| `agy --version` (~104k traps) | **200 ms**, against 300 ms via the preload and 3.70 s under `qemu-x86_64 -cpu Westmere` |
+| upstream claude-code `--version` (2,208 traps) | **0.19 s**, full interactive TUI |
+
+Roughly 60% of a POPCNT trap is the hardware exception entry/exit, which no
+software can remove; the rest is `insn_decode` plus the core.  The emulator
+costs nothing when nothing traps — counters stay flat through ordinary
+desktop use, and `ud2` still dies of `SIGILL`.
+
+### One thing this does not fix, and cannot
+
+A binary that picks code paths by **CPUID** never learns about these
+instructions: CPUID is unprivileged and, without CPUID faulting (Ivy Bridge
+and later), nothing in the kernel ever sees it.  Two real cases:
+
+- **agy** reads CPUID and calls `go/sigill-fail-fast` before executing
+  anything, so it must be patched (a two-gate binary patch; not in this
+  repo).
+- **bun**, and therefore upstream claude-code, vendors **simdutf**, which
+  selects a kernel by CPUID.  Without SSE4.2 it picks the scalar `fallback`
+  — and that implementation hangs: it reports "first non-ASCII at index 0"
+  for a chunk whose byte 0 is ASCII, so the caller advances by zero forever.
+  Forcing `SIMDUTF_FORCE_IMPLEMENTATION=fallback` reproduces the hang on any
+  CPU; `SIMDUTF_FORCE_IMPLEMENTATION=westmere` selects the SSE4.2 kernel,
+  which this emulator then supplies, and the binary works.  simdutf's own
+  documented override does the whole job — no patching, no CPUID spoofing.
+
+The general shape: **this makes the instructions available; something else
+still has to make the binary choose to use them.**
+
 ## Validation
 
 `core/` is what both mechanisms compute with, and it is checked against the
