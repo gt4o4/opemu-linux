@@ -1,13 +1,15 @@
 diff --color -Naur a/arch/x86/Kconfig b/arch/x86/Kconfig
 --- a/arch/x86/Kconfig
 +++ b/arch/x86/Kconfig
-@@ -1760,6 +1760,18 @@
+@@ -1760,6 +1760,20 @@
  	  specific cases in protected and virtual-8086 modes. Emulated
  	  results are dummy.
  
 +config X86_UD_EMULATE
 +	bool "Emulate SSE4.2, POPCNT, AES-NI and PCLMULQDQ for user space"
 +	depends on X86_64
++	select CRC32
++	select CRYPTO_LIB_AES
 +	help
 +	  Emulate, from the #UD trap, the SSE4.2 (POPCNT, CRC32, PCMPGTQ,
 +	  PCMPxSTRx), AES-NI and PCLMULQDQ instructions on CPUs that lack

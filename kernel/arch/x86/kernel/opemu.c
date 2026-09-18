@@ -270,6 +270,34 @@ static void xmm_write(int n, const u8 buf[16])
 	}
 }
 
+/*
+ * The core's PCMPxSTRx run on SSE2 and borrow xmm12..xmm15 (the contract is
+ * in opemu-core.h).  Those hold the TASK's values here, so they are parked
+ * around the call and put back — eight movdqu, before anything else is
+ * written.
+ */
+struct xmm_scratch { u8 r[4][16]; };
+
+static __always_inline void xmm_scratch_save(struct xmm_scratch *s)
+{
+	asm volatile("movdqu %%xmm12, %0\n\t"
+		     "movdqu %%xmm13, %1\n\t"
+		     "movdqu %%xmm14, %2\n\t"
+		     "movdqu %%xmm15, %3"
+		     : "=m" (*(u8 (*)[16])s->r[0]), "=m" (*(u8 (*)[16])s->r[1]),
+		       "=m" (*(u8 (*)[16])s->r[2]), "=m" (*(u8 (*)[16])s->r[3]));
+}
+
+static __always_inline void xmm_scratch_restore(const struct xmm_scratch *s)
+{
+	asm volatile("movdqu %0, %%xmm12\n\t"
+		     "movdqu %1, %%xmm13\n\t"
+		     "movdqu %2, %%xmm14\n\t"
+		     "movdqu %3, %%xmm15"
+		     : : "m" (*(const u8 (*)[16])s->r[0]), "m" (*(const u8 (*)[16])s->r[1]),
+			 "m" (*(const u8 (*)[16])s->r[2]), "m" (*(const u8 (*)[16])s->r[3]));
+}
+
 /* ---- the executor, shared by both paths ------------------------------ */
 
 /* Is the feature this op belongs to actually missing on this CPU? */
@@ -350,10 +378,12 @@ static __always_inline enum opemu_family opemu_execute(struct pt_regs *regs, con
 			return F_PCMPGTQ;
 		case OPEMU_OP_PCMPISTRI: case OPEMU_OP_PCMPISTRM:
 		case OPEMU_OP_PCMPESTRI: case OPEMU_OP_PCMPESTRM: {
+			struct xmm_scratch xs;
 			u32 idx = 0;
 			u64 fl = 0;
 			enum opemu_family fam;
 
+			xmm_scratch_save(&xs);
 			if (d->op == OPEMU_OP_PCMPESTRI || d->op == OPEMU_OP_PCMPESTRM) {
 				/* lengths in (R|E)AX / (R|E)DX, SIGNED; REX.W picks the width */
 				s64 la = d->rexw ? (s64)regs->ax : (s64)(s32)regs->ax;
@@ -367,6 +397,7 @@ static __always_inline enum opemu_family opemu_execute(struct pt_regs *regs, con
 				sse42emu_pcmpistr(a, b, d->imm, &idx, mask, &fl);
 				fam = d->op == OPEMU_OP_PCMPISTRI ? F_PCMPISTRI : F_PCMPISTRM;
 			}
+			xmm_scratch_restore(&xs);
 			if (d->op == OPEMU_OP_PCMPISTRI || d->op == OPEMU_OP_PCMPESTRI)
 				regs->cx = idx;			/* ECX, zero-extended */
 			else
